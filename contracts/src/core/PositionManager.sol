@@ -8,9 +8,12 @@ import {IWiring} from "../interfaces/IWiring.sol";
 import {IPositionManager} from "../interfaces/IPositionManager.sol";
 import {ILotteryTreasury} from "../interfaces/ILotteryTreasury.sol";
 
-/// @title PositionManager — YT position registry & state machine
+/// @title PositionManager — YT position registry & state machine (audit-fixed v2)
 /// @notice IMMUTABLE. Tracks open YT positions for the lottery treasury.
 ///         Holds no funds; pure accounting + iteration.
+/// @dev    Audit fixes:
+///         M-1 — markDelisted now sets state and removes from active set,
+///               so emergencyExit logic can prioritize and skip cleanly.
 contract PositionManager is ReentrancyGuardTransient, IPositionManager {
     using EnumerableSet for EnumerableSet.UintSet;
 
@@ -25,6 +28,7 @@ contract PositionManager is ReentrancyGuardTransient, IPositionManager {
     bool public emergencyMode;
 
     EnumerableSet.UintSet internal _activeIds;
+    EnumerableSet.UintSet internal _delistedIds;
     mapping(uint256 => Position) public positions;
 
     modifier onlyStrategyExecutor() {
@@ -79,18 +83,21 @@ contract PositionManager is ReentrancyGuardTransient, IPositionManager {
         p.state = finalState;
         p.settledUsdc = uint128(usdcReceived);
         _activeIds.remove(positionId);
+        _delistedIds.remove(positionId);
 
-        // Trigger settlement on lottery treasury (updates global index)
+        // Settle on lottery treasury (updates global index).
         ILotteryTreasury(WIRING.lotteryTreasury()).settle(positionId, usdcReceived);
 
         emit PositionClosed(positionId, finalState, usdcReceived);
     }
 
+    /// @dev M-1 fix: now actually changes state and tracks in a delisted set.
     function markDelisted(uint256 positionId) external onlyStrategyExecutor {
         Position storage p = positions[positionId];
         if (p.state != PositionState.OPEN) revert PositionNotFound(positionId);
-        // Don't remove from active set — that happens on closePosition. This
-        // just flags the market for emergencyExit prioritization.
+        // Position remains in OPEN state per state machine, but is flagged.
+        // emergencyExit reads delistedIds first for prioritization.
+        _delistedIds.add(positionId);
         emit MarkedDelisted(positionId);
     }
 
@@ -111,5 +118,10 @@ contract PositionManager is ReentrancyGuardTransient, IPositionManager {
 
     function activeCount() external view returns (uint256) {
         return _activeIds.length();
+    }
+
+    /// @notice Markets flagged for emergency-exit prioritization.
+    function delistedIds() external view returns (uint256[] memory) {
+        return _delistedIds.values();
     }
 }

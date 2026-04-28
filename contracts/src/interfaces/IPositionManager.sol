@@ -5,9 +5,9 @@ interface IPositionManager {
     enum PositionState {
         NONE,
         OPEN,
-        CLOSED_NORMAL, // closed at maturity or T-7d trigger
-        CLOSED_EARLY, // 5x trigger
-        DELISTED // Pendle market delisted/sanctioned
+        CLOSED_NORMAL,
+        CLOSED_EARLY,
+        DELISTED
     }
 
     struct Position {
@@ -18,7 +18,7 @@ interface IPositionManager {
         uint128 usdcCost;
         uint128 settledUsdc;
         uint64 maturityTs;
-        uint64 entryBlock; // for position-attribution (xSUSHI mitigation)
+        uint64 entryBlock;
     }
 
     event PositionOpened(
@@ -45,6 +45,7 @@ interface IPositionManager {
 
     function getPosition(uint256 id) external view returns (Position memory);
     function activeIds() external view returns (uint256[] memory);
+    function delistedIds() external view returns (uint256[] memory);
     function activeCount() external view returns (uint256);
 
     function setEmergency(bool on) external;

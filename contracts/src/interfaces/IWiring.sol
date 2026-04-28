@@ -12,6 +12,17 @@ interface IWiring {
     function yieldSweeper() external view returns (address);
     function guardian() external view returns (address);
     function admin() external view returns (address);
+    function coresLocked() external view returns (bool);
+
+    function setAll(
+        address principalVault,
+        address lotteryTreasury,
+        address positionManager,
+        address strategyExecutor,
+        address yieldSweeper,
+        address curator,
+        address guardian
+    ) external;
 
     function setStrategyExecutor(address) external;
     function setYieldSweeper(address) external;

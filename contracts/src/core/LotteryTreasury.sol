@@ -10,29 +10,24 @@ import {IWiring} from "../interfaces/IWiring.sol";
 import {ILotteryTreasury} from "../interfaces/ILotteryTreasury.sol";
 import {ICurator} from "../interfaces/ICurator.sol";
 import {IPrincipalVault} from "../interfaces/IPrincipalVault.sol";
-import {IPositionManager} from "../interfaces/IPositionManager.sol";
 
-/// @title LotteryTreasury — yield-only convex lottery pool
+/// @title LotteryTreasury — yield-only convex lottery pool (audit-fixed v2)
 /// @notice Holds USDC swept from PrincipalVault yield. Funds Pendle YT
 ///         purchases via StrategyExecutor (allowance-scoped). Receives YT
 ///         settlement proceeds and distributes pro-rata to dCURATOR holders
-///         via a sushibar-style global share index.
+///         via a sushibar-style global share index — with a deposit lockup
+///         that defeats JIT flash-loan extraction.
 /// @dev    IMMUTABLE.
 ///
-///         INVARIANT (I2): cumulativeStrategySpend ≤ cumulativeYieldSwept
-///         INVARIANT (I4): globalShareIndex strictly non-decreasing
-///
-///         The share-index pattern (1e30 precision):
-///           on settle(payout):
-///             profit = max(0, payout - costBasis)
-///             fee    = profit * feeBps / 10_000
-///             net    = payout - fee
-///             delta  = (net * 1e30) / dCURATOR.totalSupply()  (floor)
-///             globalShareIndex += delta
-///           on user balance change (mint/burn/transfer):
-///             owed = balance * (globalShareIndex - userIndexCheckpoint) / 1e30
-///             userClaimable += owed
-///             userIndexCheckpoint = globalShareIndex
+///         Audit fixes:
+///         C-5 — Deposit lockup (LOCKUP_DURATION = 1 day) before lottery
+///               accrual starts. Defeats xSUSHI / flash-loan JIT settlement
+///               extraction. v2 will replace with full position-attribution.
+///         H-2 — claim() takes no argument; only msg.sender can withdraw their
+///               own claimable balance. No more force-claim grief vector.
+///         M-4 — nonReentrant on creditYield/notifyPurchase/approveStrategyExecutor.
+///         M-7 — notifyPurchase rejects duplicate positionId.
+///         I-3 — settle requires positionCostBasis > 0 (was registered).
 contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
     using SafeERC20 for IERC20;
     using Math for uint256;
@@ -45,34 +40,43 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
     error NotPrincipalVault();
     error NothingToClaim();
     error AlreadySettled(uint256 positionId);
+    error DuplicatePositionId(uint256 positionId);
+    error PositionNotRegistered(uint256 positionId);
+    error InvariantBroken_I2();
+
+    /* -------------------------------- constants ------------------------------- */
+
+    uint256 private constant INDEX_PRECISION = 1e30;
+
+    /// @notice Lockup before lottery accrual starts. Defeats flash-loan JIT.
+    uint64 public constant LOCKUP_DURATION = 1 days;
 
     /* -------------------------------- immutables ------------------------------ */
 
     IERC20 public immutable USDC;
     IWiring public immutable WIRING;
 
-    /// @notice Sushibar index precision
-    uint256 private constant INDEX_PRECISION = 1e30;
-
     /* --------------------------------- storage -------------------------------- */
 
-    // Slot 0 (packed)
-    uint128 public totalUnsettled; // USDC equivalent in flight in YT positions
-    uint128 public totalSettled;   // cumulative settled winnings (gross)
+    uint128 public totalUnsettled;
+    uint128 public totalSettled;
 
-    // Slot 1
     uint256 public globalShareIndex;
 
-    // Cumulative tracking for I2 invariant
     uint256 public cumulativeYieldSwept;
     uint256 public cumulativeStrategySpend;
 
-    // Per-user state
+    /// @notice Per-user index checkpoint (sushibar pattern).
     mapping(address => uint256) public userIndexCheckpoint;
+    /// @notice Per-user pending USDC owed.
     mapping(address => uint256) public userClaimable;
+    /// @notice C-5: monotone-set on first transition zero→positive balance.
+    ///         Cleared on transition positive→zero. Lockup = now - thisTs.
+    mapping(address => uint64) public userFirstHoldTimestamp;
 
-    // Per-position settlement (idempotency)
+    /// @notice Idempotency on settle.
     mapping(uint256 => bool) public positionSettled;
+    /// @notice Cost basis recorded by notifyPurchase. M-7: must not overwrite.
     mapping(uint256 => uint256) public positionCostBasis;
 
     /* ------------------------------- modifiers ------------------------------- */
@@ -106,43 +110,44 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
 
     /* ------------------------------ yield ingress ----------------------------- */
 
-    /// @notice Called by YieldSweeper after USDC has been transferred in.
-    function creditYield(uint256 amount) external onlyYieldSweeper {
+    function creditYield(uint256 amount) external nonReentrant onlyYieldSweeper {
         cumulativeYieldSwept += amount;
         emit YieldCredited(amount, cumulativeYieldSwept);
     }
 
     /* ----------------------------- strategy hooks ---------------------------- */
 
-    /// @notice Called by StrategyExecutor after a YT purchase. Records cost
-    ///         basis and increments unsettled tally.
-    /// @dev    Checked: cumulative spend ≤ cumulative yield swept (I2).
-    function notifyPurchase(uint256 positionId, uint256 usdcSpent) external onlyStrategyExecutor {
+    function notifyPurchase(uint256 positionId, uint256 usdcSpent)
+        external
+        nonReentrant
+        onlyStrategyExecutor
+    {
+        // M-7: prevent overwrite of existing cost basis.
+        if (positionCostBasis[positionId] != 0) revert DuplicatePositionId(positionId);
+
         cumulativeStrategySpend += usdcSpent;
-        // I2 invariant check (defense-in-depth; primary enforcement is by
-        // StrategyExecutor not over-spending vs. our balance, but we double
-        // check here):
-        require(cumulativeStrategySpend <= cumulativeYieldSwept, "I2 violated");
+        if (cumulativeStrategySpend > cumulativeYieldSwept) revert InvariantBroken_I2();
 
         positionCostBasis[positionId] = usdcSpent;
         totalUnsettled += uint128(usdcSpent);
         emit PurchaseNotified(positionId, usdcSpent);
     }
 
-    /// @notice Called by PositionManager after a YT close. Updates global index
-    ///         pro-rata to dCURATOR totalSupply at this moment.
-    function settle(uint256 positionId, uint256 usdcReceived) external onlyPositionManager nonReentrant {
+    function settle(uint256 positionId, uint256 usdcReceived)
+        external
+        nonReentrant
+        onlyPositionManager
+    {
         if (positionSettled[positionId]) revert AlreadySettled(positionId);
         positionSettled[positionId] = true;
 
         uint256 cost = positionCostBasis[positionId];
+        // I-3: must have been registered via notifyPurchase.
+        if (cost == 0) revert PositionNotRegistered(positionId);
 
-        // Decrement the unsettled tally by the original cost basis (not the
-        // received amount — even on losses).
         totalUnsettled = uint128(uint256(totalUnsettled) - cost);
         totalSettled += uint128(usdcReceived);
 
-        // Curator fee on profit only
         uint256 fee;
         if (usdcReceived > cost) {
             uint256 profit;
@@ -157,26 +162,54 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
         }
 
         uint256 net = usdcReceived - fee;
-
-        // Index update: floor div, dust stays in treasury for next settlement
         uint256 totalShares = IERC20(WIRING.principalVault()).totalSupply();
         if (totalShares > 0 && net > 0) {
             uint256 delta = (net * INDEX_PRECISION) / totalShares;
             globalShareIndex += delta;
         }
+        // If totalShares == 0, the net stays in this contract's USDC balance,
+        // available for next settlement's index update.
 
         emit Settled(positionId, usdcReceived, fee, globalShareIndex);
     }
 
     /* ----------------------------- accrual / claim ---------------------------- */
 
-    /// @notice Called by PrincipalVault on every dCURATOR balance change.
-    ///         Snapshots user's claimable USDC at the current global index.
     function accrueOnBalanceChange(address user) external onlyPrincipalVault {
         _accrue(user);
     }
 
+    function onPositiveBalance(address user) external onlyPrincipalVault {
+        if (userFirstHoldTimestamp[user] == 0) {
+            userFirstHoldTimestamp[user] = uint64(block.timestamp);
+            // Sync checkpoint to current index so pre-lockup growth doesn't accrue.
+            userIndexCheckpoint[user] = globalShareIndex;
+            emit UserLockupStarted(user, uint64(block.timestamp));
+        }
+    }
+
+    function onZeroBalance(address user) external onlyPrincipalVault {
+        userFirstHoldTimestamp[user] = 0;
+        userIndexCheckpoint[user] = globalShareIndex;
+        emit UserLockupReset(user);
+        // Note: any past-lockup userClaimable is preserved across the cycle.
+    }
+
     function _accrue(address user) internal {
+        uint64 firstHold = userFirstHoldTimestamp[user];
+
+        // No firstHold yet (never held a positive balance, or post-zero).
+        if (firstHold == 0) {
+            userIndexCheckpoint[user] = globalShareIndex;
+            return;
+        }
+
+        // Still in lockup window: skip accrual, sync checkpoint forward.
+        if (block.timestamp < firstHold + LOCKUP_DURATION) {
+            userIndexCheckpoint[user] = globalShareIndex;
+            return;
+        }
+
         uint256 currentIdx = globalShareIndex;
         uint256 lastIdx = userIndexCheckpoint[user];
         if (currentIdx == lastIdx) return;
@@ -193,16 +226,21 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
         userIndexCheckpoint[user] = currentIdx;
     }
 
-    function claim(address user) external nonReentrant returns (uint256 amount) {
-        _accrue(user);
-        amount = userClaimable[user];
+    /// @notice H-2 fix: msg.sender claims their own. No force-claim possible.
+    function claim() external nonReentrant returns (uint256 amount) {
+        _accrue(msg.sender);
+        amount = userClaimable[msg.sender];
         if (amount == 0) revert NothingToClaim();
-        userClaimable[user] = 0;
-        USDC.safeTransfer(user, amount);
-        emit Claimed(user, amount);
+        userClaimable[msg.sender] = 0;
+        USDC.safeTransfer(msg.sender, amount);
+        emit Claimed(msg.sender, amount);
     }
 
     function claimableOf(address user) external view returns (uint256) {
+        uint64 firstHold = userFirstHoldTimestamp[user];
+        if (firstHold == 0) return userClaimable[user];
+        if (block.timestamp < firstHold + LOCKUP_DURATION) return userClaimable[user];
+
         uint256 currentIdx = globalShareIndex;
         uint256 lastIdx = userIndexCheckpoint[user];
         uint256 balance = IERC20(WIRING.principalVault()).balanceOf(user);
@@ -220,10 +258,7 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
     /* ------------------------------- approvals ------------------------------- */
 
     /// @notice One-shot exact approval to StrategyExecutor for a single swap.
-    /// @dev    Called by StrategyExecutor immediately before the Pendle swap;
-    ///         the executor revokes (forceApprove(0)) immediately after.
-    function approveStrategyExecutor(uint256 amount) external onlyStrategyExecutor {
-        // SafeERC20.forceApprove handles USDC's non-zero-to-non-zero quirk
+    function approveStrategyExecutor(uint256 amount) external nonReentrant onlyStrategyExecutor {
         IERC20(USDC).forceApprove(msg.sender, amount);
     }
 }

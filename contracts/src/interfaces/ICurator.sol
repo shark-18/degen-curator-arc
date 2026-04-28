@@ -10,22 +10,25 @@ interface ICurator {
     event FeeRecipientUpdated(address indexed oldR, address indexed newR);
     event PausedAll(address indexed guardian, uint256 timestamp);
 
-    function proposeWhitelistMarket(address market, bool ok) external;
+    function proposeWhitelistMarket(address market) external;
     function commitWhitelistMarket(address market) external;
     function vetoWhitelistMarket(address market) external; // guardian only
+    function emergencyRemoveFromWhitelist(address market) external; // guardian only
 
     function setWeeklyBasket(address[] calldata markets) external;
     function getWeeklyBasket() external view returns (address[] memory);
 
     function isMarketWhitelisted(address market) external view returns (bool);
 
-    function setFee(uint16 bps) external;
-    function setFeeRecipient(address r) external;
+    /// @notice Fee changes are timelocked: propose, wait, commit.
+    function proposeFee(uint16 bps) external;
+    function commitFee() external;
+    function proposeFeeRecipient(address r) external;
+    function commitFeeRecipient() external;
+
     function feeBps() external view returns (uint16);
     function feeRecipient() external view returns (address);
 
     function pauseAll() external;
     function unpauseAll() external;
-
-    function rewireStrategy(address newExecutor) external;
 }

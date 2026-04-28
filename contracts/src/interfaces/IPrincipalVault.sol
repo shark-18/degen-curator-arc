@@ -21,13 +21,15 @@ interface IPrincipalVault is IERC4626 {
     function depositorCount() external view returns (uint32);
     function minDeposit() external view returns (uint128);
     function principalHighWater() external view returns (uint256);
+    function morphoBalanceInAssets() external view returns (uint256);
     function paused() external view returns (bool);
+    function pauseExpiresAt() external view returns (uint64);
+    function MAX_PAUSE_DURATION() external view returns (uint64);
 
-    /// @notice Sweeps yield (totalAssets() - principalHWM) to LotteryTreasury.
-    ///         Callable ONLY by the address registered at Wiring.yieldSweeper().
-    ///         Cannot reduce principalHWM under any input.
+    /// @notice Sweeps yield (morphoBalance - principalHWM) to LotteryTreasury.
     function sweepYield() external returns (uint256 yieldUsdc);
 
     function pause() external;
+    function renewPause() external;
     function unpause() external;
 }

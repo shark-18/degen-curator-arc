@@ -8,15 +8,15 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {IWiring} from "../interfaces/IWiring.sol";
 import {IYieldSweeper} from "../interfaces/IYieldSweeper.sol";
 import {IPrincipalVault} from "../interfaces/IPrincipalVault.sol";
-import {IMorphoVault} from "../interfaces/IMorphoVault.sol";
 
-/// @title YieldSweeper — pulls Morpho yield into LotteryTreasury
-/// @notice UUPS-upgradeable periphery. Has the ONLY authority to call
-///         PrincipalVault.sweepYield(). Performs no math beyond delegating
-///         to the vault — keeps the sensitive HWM logic inside the immutable
-///         core contract.
+/// @title YieldSweeper — pulls Morpho yield into LotteryTreasury (audit-fixed v2)
+/// @dev    Audit fixes:
+///         C-1 — EIP-7201 slot recomputed canonically.
+///         H-1 — Constructor disables initializers on implementation.
 contract YieldSweeper is IYieldSweeper, Initializable, UUPSUpgradeable, AccessControlUpgradeable {
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
+
+    error IntervalNotElapsed();
 
     /// @custom:storage-location erc7201:dcurator.storage.v1.YieldSweeper
     struct YS {
@@ -26,8 +26,9 @@ contract YieldSweeper is IYieldSweeper, Initializable, UUPSUpgradeable, AccessCo
         uint256[48] __gap;
     }
 
+    /// @dev keccak256(abi.encode(uint256(keccak256("dcurator.storage.v1.YieldSweeper")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant SLOT =
-        0x4ee2cd23a0c34d5e4cca8f59afe1c50e3c0c4f9be2cb2cda6f0d34a47a85ee00;
+        0x193d56f977557616239c7d9df9908a19015f37b43de560760ebdd8b99e9e0500;
 
     function _s() private pure returns (YS storage s) {
         bytes32 slot = SLOT;
@@ -36,18 +37,23 @@ contract YieldSweeper is IYieldSweeper, Initializable, UUPSUpgradeable, AccessCo
         }
     }
 
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
     function initialize(IWiring _wiring, address _admin, address _keeper) external initializer {
         __AccessControl_init();
         __UUPSUpgradeable_init();
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
         _grantRole(KEEPER_ROLE, _keeper);
         _s().wiring = _wiring;
-        _s().minIntervalSec = 6 days; // weekly minus buffer
+        _s().minIntervalSec = 6 days;
     }
 
     function sweep() external onlyRole(KEEPER_ROLE) returns (uint256 yieldUsdc) {
         YS storage s = _s();
-        require(block.timestamp >= s.lastSweepTs + s.minIntervalSec, "interval");
+        if (block.timestamp < s.lastSweepTs + s.minIntervalSec) revert IntervalNotElapsed();
         s.lastSweepTs = uint64(block.timestamp);
         yieldUsdc = IPrincipalVault(s.wiring.principalVault()).sweepYield();
         emit Swept(yieldUsdc, block.timestamp);
@@ -55,9 +61,9 @@ contract YieldSweeper is IYieldSweeper, Initializable, UUPSUpgradeable, AccessCo
 
     function pendingYield() external view returns (uint256) {
         IPrincipalVault pv = IPrincipalVault(_s().wiring.principalVault());
-        uint256 ta = pv.totalAssets();
+        uint256 morphoBalance = pv.morphoBalanceInAssets();
         uint256 hwm = pv.principalHighWater();
-        return ta > hwm ? ta - hwm : 0;
+        return morphoBalance > hwm ? morphoBalance - hwm : 0;
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
