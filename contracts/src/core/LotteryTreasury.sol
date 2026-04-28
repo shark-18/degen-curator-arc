@@ -110,7 +110,10 @@ contract LotteryTreasury is ReentrancyGuardTransient, ILotteryTreasury {
 
     /* ------------------------------ yield ingress ----------------------------- */
 
-    function creditYield(uint256 amount) external nonReentrant onlyYieldSweeper {
+    /// @dev Called by PrincipalVault.sweepYield() right after transferring
+    ///      USDC into this contract. The PrincipalVault gate is itself
+    ///      protected by onlyYieldSweeper, so this is end-to-end-trusted.
+    function creditYield(uint256 amount) external nonReentrant onlyPrincipalVault {
         cumulativeYieldSwept += amount;
         emit YieldCredited(amount, cumulativeYieldSwept);
     }
