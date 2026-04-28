@@ -1,0 +1,6 @@
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/
+solady/=lib/solady/src/
+forge-std/=lib/forge-std/src/
+@pendle/=lib/pendle-core-v2-public/contracts/
+morpho-blue/=lib/morpho-blue/src/
