@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import "@rainbow-me/rainbowkit/styles.css";
+
+html, body { background: #0a0a0a; color: #dddddd; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+body { padding: 0; margin: 0; }
